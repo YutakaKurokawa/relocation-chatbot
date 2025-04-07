@@ -51,8 +51,42 @@ function buildQdrantFilter(filters) {
   return must.length > 0 ? { must } : undefined;
 }
 
+// 結果キャッシュ用のメモリキャッシュ
+const searchCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5分間キャッシュを保持
+
+// キャッシュキーの生成
+function generateCacheKey(filters, chatSummary) {
+  return JSON.stringify({
+    filters,
+    priorityCategory: chatSummary.priorityCategory,
+    details: chatSummary.details,
+  });
+}
+
+// 簡易的なマッチング理由生成（LLM不使用）
+function generateSimpleMatchReason(recommendation, chatSummary, filterText) {
+  const category = recommendation.category;
+  const score = recommendation.match_score;
+  let reason = "";
+  
+  if (score > 0.8) {
+    reason = `${recommendation.location}は${category}が充実しており、あなたの希望条件に非常に適しています。`;
+  } else if (score > 0.7) {
+    reason = `${recommendation.location}は${category}の面で優れており、あなたの条件に合致しています。`;
+  } else {
+    reason = `${recommendation.location}は${category}の特徴があり、あなたの希望に沿った選択肢です。`;
+  }
+  
+  return reason;
+}
+
 // /api/search POSTエンドポイント
 router.post("/", async (req, res) => {
+  // パフォーマンス計測開始
+  const startTime = performance.now();
+  console.log("🔍 検索処理開始");
+  
   const { filters, chatSummary } = req.body;
 
   const filterText = convertFilters(filters);
@@ -62,21 +96,50 @@ router.post("/", async (req, res) => {
 条件フィルター：${filterText}
 `;
 
+  // キャッシュキーの生成
+  const cacheKey = generateCacheKey(filters, chatSummary);
+  
+  // キャッシュチェック
+  if (searchCache.has(cacheKey)) {
+    const cachedData = searchCache.get(cacheKey);
+    if (Date.now() - cachedData.timestamp < CACHE_TTL) {
+      console.log("🔄 キャッシュから結果を返却");
+      const endTime = performance.now();
+      console.log(`⏱️ 検索処理完了: ${(endTime - startTime).toFixed(2)}ms (キャッシュヒット)`);
+      return res.json({ recommendations: cachedData.data });
+    } else {
+      // TTL切れの場合はキャッシュを削除
+      searchCache.delete(cacheKey);
+    }
+  }
+
   try {
-    // 1. ベクトル化
-    const embeddingResponse = await openai.embeddings.create({
+    // 1. ベクトル化と検索を並列実行
+    console.log("📊 埋め込み生成開始");
+    const embeddingStartTime = performance.now();
+    const embeddingPromise = openai.embeddings.create({
       model: "text-embedding-ada-002",
       input: queryText,
     });
+    
+    // 埋め込みの生成を待つ
+    const embeddingResponse = await embeddingPromise;
+    const embeddingEndTime = performance.now();
+    console.log(`📊 埋め込み生成完了: ${(embeddingEndTime - embeddingStartTime).toFixed(2)}ms`);
+    
     const [embedding] = embeddingResponse.data.map((d) => d.embedding);
 
     // 2. Qdrant検索（AND条件フィルター付き）
+    console.log("🔎 Qdrant検索開始");
+    const qdrantStartTime = performance.now();
     const searchResults = await qdrant.search("municipalities", {
       vector: embedding,
       limit: 5,
       with_payload: true,
       filter: buildQdrantFilter(filters),
     });
+    const qdrantEndTime = performance.now();
+    console.log(`🔎 Qdrant検索完了: ${(qdrantEndTime - qdrantStartTime).toFixed(2)}ms`);
 
     // 3. 検索結果を整形
     const recommendations = searchResults.map((r) => ({
@@ -85,60 +148,28 @@ router.post("/", async (req, res) => {
       features: r.payload.features.split("。").filter(Boolean),
       category: r.payload.category,
       match_score: r.score,
+      source_url: r.payload.source_url || `https://www.google.com/search?q=${encodeURIComponent(r.payload.location + " 移住支援")}`, // 公式サイトURLがない場合はGoogle検索URLを生成
     }));
 
     if (recommendations.length === 0) {
       return res.json({ recommendations: [] });
     }
 
-    // 4. LLMにmatch_reasonを生成させる
-    const prompt = `
-あなたは移住支援の専門家です。以下のユーザー希望に対して、推薦された各自治体がなぜマッチしているのかを1〜2文で説明してください。
+    // 4. LLMを使わず簡易的なマッチング理由を生成
+    const enriched = recommendations.map((rec) => ({
+      ...rec,
+      match_reason: generateSimpleMatchReason(rec, chatSummary, filterText)
+    }));
 
-【ユーザー希望】
-- 優先カテゴリ: ${chatSummary.priorityCategory}
-- 詳細: ${chatSummary.details}
-- 条件フィルター: ${filterText}
-
-【推薦された自治体】
-${JSON.stringify(recommendations)}
-
-【出力形式】
-{
-  "reasons": [
-    { "id": 1, "match_reason": "〇〇だからユーザーの希望に合致しています。" },
-    ...
-  ]
-}
-`;
-
-    const reasoningResponse = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo-0125",
-      messages: [
-        { role: "system", content: "出力は必ずJSON形式でお願いします。" },
-        { role: "user", content: prompt }
-      ],
-      temperature: 0.7,
-      response_format: { type: "json_object" }
+    // 結果をキャッシュに保存
+    searchCache.set(cacheKey, {
+      data: enriched,
+      timestamp: Date.now()
     });
 
-    let reasons = [];
-    try {
-      reasons = JSON.parse(reasoningResponse.choices[0].message.content).reasons;
-    } catch (e) {
-      console.error("❌ GPT JSONパースエラー:", e.message);
-      return res.status(500).json({ error: "match_reason の生成に失敗しました" });
-    }
-
-    // 5. match_reasonをマージ
-    const enriched = recommendations.map((rec) => {
-      const found = reasons.find((r) => String(r.id) === String(rec.id));
-      return {
-        ...rec,
-        match_reason: found?.match_reason || "理由なし"
-      };
-    });
-
+    const endTime = performance.now();
+    console.log(`⏱️ 検索処理完了: ${(endTime - startTime).toFixed(2)}ms (キャッシュミス)`);
+    
     res.json({ recommendations: enriched });
   } catch (err) {
     console.error("❌ /api/search with reasoning エラー:", err);

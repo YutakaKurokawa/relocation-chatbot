@@ -10,17 +10,24 @@ import ConditionFilters from "./condition-filters";
 import RecommendationCard from "./recommendation-card";
 import type { FilterConditions } from "@/types/filters";
 import { fetchRecommendations } from "@/lib/api";
+import { v4 as uuidv4 } from 'uuid';
+
+type Recommendation = {
+  id: string;
+  location: string;
+  features: string[];
+  category: string;
+  match_score: number;
+  match_reason?: string;
+  source_url: string; // Required by RecommendationCard
+  quote?: string;     // Optional in RecommendationCard
+};
 
 type Message = {
   id: string;
   role: "user" | "bot";
   content: string;
-  recommendation?: {
-    location: string;
-    features: string[];
-    match_reason?: string;
-    source_url: string;
-  };
+  recommendation?: Recommendation;
 };
 
 export default function RelocationChatbot() {
@@ -83,7 +90,7 @@ export default function RelocationChatbot() {
         ]);
       } else {
         const recMessages = topResults.map((rec) => ({
-          id: Date.now().toString(),
+          id: uuidv4(),
           role: "bot",
           content: "あなたの条件に合った移住先が見つかりました！",
           recommendation: rec,
@@ -115,53 +122,69 @@ export default function RelocationChatbot() {
       role: "user",
       content: input,
     };
-  
+    
+    const userInput = input; // 入力内容を保存
     setMessages((prev) => [...prev, userMessage]);
     setInput("");
     setIsLoading(true);
+    
+    // 処理中メッセージを追加
+    const processingMessageId = Date.now().toString();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: processingMessageId,
+        role: "bot",
+        content: refinementAsked ? "条件に合った移住先を検索中です..." : "メッセージを処理中です...",
+      },
+    ]);
   
     try {
-      // ① GPTで聞き返し取得
-      const chatRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: input }),
-      });
-  
-      const data = await chatRes.json();
-  
-      // ② refinementAskedが false → GPTの聞き返しを表示して状態更新
       if (!refinementAsked) {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: Date.now().toString(),
-            role: "bot",
-            content: data.reply,
-          },
-        ]);
+        // ① GPTで聞き返し取得
+        const chatRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message: userInput }),
+        });
+    
+        const data = await chatRes.json();
+    
+        // 処理中メッセージを実際の返信に置き換え
+        setMessages((prev) => 
+          prev.map(msg => 
+            msg.id === processingMessageId 
+              ? { ...msg, content: data.reply }
+              : msg
+          )
+        );
+        
         setRefinementAsked(true); // 🔥 次回からはもう聞き返さない
       } else {
         // ③ 2回目以降は即検索へ
         await searchAndAppendRecommendations({
           priorityCategory: "チャット指定",
-          details: input,
+          details: userInput,
         });
+        
+        // 処理中メッセージを削除
+        setMessages((prev) => prev.filter(msg => msg.id !== processingMessageId));
       }
     } catch (error) {
       console.error("GPTチャットエラー:", error);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: Date.now().toString(),
-          role: "bot",
-          content: "GPTとの通信中にエラーが発生しました。",
-        },
-      ]);
+      
+      // エラー時は処理中メッセージをエラーメッセージに置き換え
+      setMessages((prev) => 
+        prev.map(msg => 
+          msg.id === processingMessageId 
+            ? { ...msg, content: "処理中にエラーが発生しました。もう一度お試しください。" }
+            : msg
+        )
+      );
     } finally {
       setIsLoading(false);
     }
-  };  
+  };
   
   const handleFilterSearch = async () => {
     if (Object.values(filters).every((v) => v === 0)) {
@@ -177,13 +200,38 @@ export default function RelocationChatbot() {
     }
   
     setIsLoading(true);
-  
-    await searchAndAppendRecommendations({
-      priorityCategory: "条件検索",
-      details: "特に指定なし",
-    });
-  
-    setIsLoading(false);
+    
+    // 検索中メッセージを追加
+    const searchingMessageId = Date.now().toString();
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: searchingMessageId,
+        role: "bot",
+        content: "条件に合った移住先を検索中です...",
+      },
+    ]);
+    
+    try {
+      await searchAndAppendRecommendations({
+        priorityCategory: "条件検索",
+        details: "特に指定なし",
+      });
+      
+      // 検索中メッセージを削除
+      setMessages((prev) => prev.filter(msg => msg.id !== searchingMessageId));
+    } catch (error) {
+      // エラー時は検索中メッセージをエラーメッセージに置き換え
+      setMessages((prev) => 
+        prev.map(msg => 
+          msg.id === searchingMessageId 
+            ? { ...msg, content: "検索中にエラーが発生しました。もう一度お試しください。" }
+            : msg
+        )
+      );
+    } finally {
+      setIsLoading(false);
+    }
   };
   
 
