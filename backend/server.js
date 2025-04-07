@@ -13,7 +13,7 @@ app.use("/api/chat", require("./routes/chat"));
 app.use("/api/search", require("./routes/search"));
 app.use("/api/municipalities", require("./routes/municipalities"));
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`API Server running at http://localhost:${PORT}`);
 });
